@@ -1,11 +1,13 @@
 //! Unified publish/subscribe abstraction with in-memory and Redis backends.
 //!
 //! This module provides a trait [`PubSubBackend`] and two implementations:
-//! [`InMemoryPubSub`] for local, in-process message passing.
+//! [`InMemoryPubSub`] for local, in-process message passing, and [`RedisPubSub`]
+//! for distributed Pub/Sub across processes and machines.
 //!
 //! Both backends serialize messages to JSON bytes internally, and expose a
 //! consistent async interface for publishing and subscribing. In-memory
-//! uses Tokio’s [`broadcast`] channels with a configurable per-topic buffer.
+//! uses Tokio’s [`broadcast`] channels with a configurable per-topic buffer,
+//! while Redis uses its native `PUBSUB` feature with automatic reconnects.
 //!
 //! ## Example Usage
 //! ```no_run
@@ -31,6 +33,7 @@
 //! ```
 use async_trait::async_trait;
 use crate::error::PubSubError;
+use redis::Client;
 use serde::Serialize;
 use serde_json::to_vec;
 use std::{
@@ -202,6 +205,145 @@ impl PubSubBackend for InMemoryPubSub {
   }
 }
 
+const BASE_DELAY_MS: u64 = 100;
+const MAX_DELAY_MS: u64 = 5_000;
+const MAX_EXPONENT: u32 = 6;
+const JITTER_RANGE: u64 = 50;
+
+#[derive(Clone, Debug)]
+pub struct BackoffConfig {
+  pub base_delay_ms: u64,
+  pub max_delay_ms: u64,
+  pub max_exponent: u32,
+  pub jitter_range: u64,
+  pub max_retries: u32,
+}
+
+impl Default for BackoffConfig {
+  fn default() -> Self {
+    Self {
+      base_delay_ms: BASE_DELAY_MS,
+      max_delay_ms: MAX_DELAY_MS,
+      max_exponent: MAX_EXPONENT,
+      jitter_range: JITTER_RANGE,
+      max_retries: 10,
+    }
+  }
+}
+
+/// Redis-backed Pub/Sub for inter-process messaging.
+///
+/// Uses a dedicated connection for publishing and a `PUBSUB` subscription for receiving.
+/// Automatically attempts to reconnect with exponential backoff on connection loss.
+#[derive(Clone)]
+pub struct RedisPubSub {
+  client: Client,
+  backoff_config: BackoffConfig,
+}
+
+impl RedisPubSub {
+  /// Create a new Redis backend from a connection string.
+  ///
+  /// Example: `RedisPubSub::new("redis://127.0.0.1/")?`
+  pub fn new(addr: &str) -> Result<Self, PubSubError> {
+    Ok(Self { 
+      client: Client::open(addr)?,
+      backoff_config: BackoffConfig::default()
+    })
+  }
+
+  /// Create a new Redis backend from a connection string and configuration.
+  ///
+  /// Example: `RedisPubSub::with_config("redis://127.0.0.1/", BackoffConfig::default())?`
+  pub fn with_config(addr: &str, config: BackoffConfig) -> Result<Self, PubSubError> {
+    Ok(Self { 
+      client: Client::open(addr)?,
+      backoff_config: config
+    })
+  }
+}
+
+#[async_trait]
+impl PubSubBackend for RedisPubSub {
+  async fn publish<T: Serialize + Send + Sync>(&self, topic: &str, msg: &T) -> Result<(), PubSubError> {
+    let payload = to_vec(msg)?;
+
+    let mut conn: redis::aio::MultiplexedConnection = self.client.get_multiplexed_tokio_connection().await?;
+
+    redis::AsyncCommands::publish::<&str, Vec<u8>, ()>(&mut conn, topic, payload).await?;
+    Ok(())
+  }
+
+  async fn subscribe<F, Fut>(&self, topic: &str, handler: F) -> Result<tokio::task::JoinHandle<()>, PubSubError>
+  where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+  {
+    let client = self.client.clone();
+    let topic = topic.to_string();
+    let cfg = self.backoff_config.clone();
+
+    let handle = tokio::spawn(async move {
+      let mut attempt: u32 = 0;
+
+      loop {
+        // Health check: PING before subscribe
+        match client.get_multiplexed_tokio_connection().await {
+          Ok(mut conn) => {
+            let ping_result: redis::RedisResult<String> = redis::AsyncCommands::ping(&mut conn).await;
+            if ping_result.is_err() {
+              eprintln!("Redis health check failed: {:?}", ping_result.err());
+              attempt += 1;
+            } else {
+              // Try to subscribe
+              match client.get_async_pubsub().await {
+                Ok(mut pubsub) => {
+                  if let Err(e) = pubsub.subscribe(&topic).await {
+                    eprintln!("Redis subscribe failed for '{topic}': {e}");
+                    attempt += 1;
+                  } else {
+                    attempt = 0; // Reset on success
+                    let mut stream = pubsub.on_message();
+                    while let Some(msg) = stream.next().await {
+                      match msg.get_payload::<Vec<u8>>() {
+                        Ok(payload) => handler(payload).await,
+                        Err(e) => eprintln!("Redis payload decode error on '{topic}': {e}"),
+                      }
+                    }
+                    eprintln!("Redis pubsub stream ended for '{topic}', will reconnect…");
+                  }
+                }
+                Err(e) => {
+                  eprintln!("Redis pubsub connection error: {e}. Retrying…");
+                  attempt += 1;
+                }
+              }
+            }
+          }
+          Err(e) => {
+            eprintln!("Redis connection error: {e}. Retrying…");
+            attempt += 1;
+          }
+        }
+
+        if attempt >= cfg.max_retries {
+          eprintln!("Redis pubsub: exceeded max retries ({}) for topic '{}', giving up.", cfg.max_retries, topic);
+          break;
+        }
+
+        // exponential backoff with jitter
+        let exp = attempt.min(cfg.max_exponent);
+        let base_ms = cfg.base_delay_ms.saturating_mul(2u64.saturating_pow(exp));
+        let jitter_ms = (attempt as u64 % cfg.jitter_range) + 1;
+        let delay = std::time::Duration::from_millis((base_ms + jitter_ms).min(cfg.max_delay_ms));
+        tokio::time::sleep(delay).await;
+      }
+    });
+
+    Ok(handle)
+  }
+}
+
 /// ######################################## TESTS ########################################
 
 #[cfg(test)]
@@ -218,6 +360,32 @@ mod tests {
   #[tokio::test]
   async fn in_memory_pubsub_works() {
     let backend = InMemoryPubSub::new();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+    backend.subscribe("topic", move |data| {
+      let tx = tx.clone();
+      async move {
+        let msg: TestMsg = serde_json::from_slice(&data).unwrap();
+        tx.send(msg).await.ok();
+      }
+    }).await.unwrap();
+
+    backend.publish("topic", &TestMsg { val: "hello".into() }).await.unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(received, TestMsg { val: "hello".into() });
+  }
+
+  // This test requires a running Redis instance at localhost:6379
+  // Run: `docker run -p 6379:6379 redis`
+  #[tokio::test]
+  #[ignore]
+  async fn redis_pubsub_works() {
+    let backend = RedisPubSub::new("redis://127.0.0.1/").unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
