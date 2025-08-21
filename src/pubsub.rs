@@ -1,6 +1,6 @@
-//! Unified publish/subscribe abstraction with an in-memory backend (Redis planned).
+//! Unified publish/subscribe abstraction with in-memory and Redis backends.
 //!
-//! This module provides a trait [`PubSubBackend`] with
+//! This module provides a trait [`PubSubBackend`] and two implementations:
 //! [`InMemoryPubSub`] for local, in-process message passing.
 //!
 //! Both backends serialize messages to JSON bytes internally, and expose a
