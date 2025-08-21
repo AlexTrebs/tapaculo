@@ -9,14 +9,13 @@
 //! ```
 //! use tapaculo::auth::{JwtAuth, JwtAuthOptions};
 //!
-//! let auth = JwtAuth::new("super-secret-key", JwtAuthOptions::default());
+//! let auth = JwtAuth::new("super-secret-key");
 //! let access = auth.sign_access("user42".into(), "room99".into(), 3600).unwrap();
 //! let refresh = auth.sign_refresh("user42".into(), 86400).unwrap();
 //! let claims = auth.verify_access(&access).unwrap();
 //! assert_eq!(claims.sub, "user42");
 //! assert_eq!(claims.room, "room99");
 //! ```
-
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
 use serde::{Serialize, Deserialize};
 use anyhow::{Context, Result};
@@ -84,14 +83,31 @@ impl JwtAuth {
   ///
   /// ## Parameters
   /// - `secret`: The signing key used to encode and decode JWTs.
+  ///
+  /// ## Example
+  /// ```
+  /// use tapaculo::auth::{JwtAuth, JwtAuthOptions};
+  /// let auth = JwtAuth::new("my-secret-key");
+  /// ```
+  pub fn new(secret: &str) -> Self {
+    Self {
+      secret: secret.into(),
+      options: JwtAuthOptions::default()
+    }
+  }
+
+  /// Creates a new instance of `JwtAuth` with configurable options.
+  ///
+  /// ## Parameters
+  /// - `secret`: The signing key used to encode and decode JWTs.
   /// - `options`: Configuration options including leeway, issuer, and audience.
   ///
   /// ## Example
   /// ```
   /// use tapaculo::auth::{JwtAuth, JwtAuthOptions};
-  /// let auth = JwtAuth::new("my-secret-key", JwtAuthOptions::default());
+  /// let auth = JwtAuth::with_options("my-secret-key", JwtAuthOptions::default());
   /// ```
-  pub fn new(secret: &str, options: JwtAuthOptions) -> Self {
+  pub fn with_options(secret: &str, options: JwtAuthOptions) -> Self {
     Self {
       secret: secret.into(),
       options,
@@ -213,7 +229,7 @@ mod tests {
   use std::thread::sleep;
 
   fn auth() -> JwtAuth {
-    JwtAuth::new("test-secret", JwtAuthOptions::default())
+    JwtAuth::new("test-secret")
   }
 
   #[test]

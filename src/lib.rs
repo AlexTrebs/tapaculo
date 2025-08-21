@@ -1,4 +1,6 @@
 //! JWT authentication utilities: sign, verify, and refresh tokens.
-mod auth;
+pub mod auth;
+pub mod error;
+pub mod pubsub;
 
 pub use auth::{JwtAuth, JwtAuthOptions, AccessClaims, RefreshClaims};
