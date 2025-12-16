@@ -1,6 +1,6 @@
 [package]
 name = "tapaculo"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Alex Trebs email@alextrebilcock.co.uk"]
 description = "Lightweight Rust server for real-time and turn-based multiplayer communication"
