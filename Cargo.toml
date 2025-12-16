@@ -1,14 +1,25 @@
 [package]
 name = "tapaculo"
-version = "0.2.0"
-edition = "2024"
+version = "1.0.0"
+edition = "2021"
+authors = ["Alex Trebs email@alextrebilcock.co.uk"]
+description = "Lightweight Rust server for real-time and turn-based multiplayer communication"
+repository = "https://github.com/AlexTrebs/tapaculo"
+homepage = "https://github.com/AlexTrebs/tapaculo"
+documentation = "https://docs.rs/tapaculo"
+license = "MIT"
+keywords = ["websocket", "multiplayer", "game-server", "realtime", "pubsub"]
+categories = ["game-development", "network-programming", "web-programming::websocket"]
+readme = "README.md"
+exclude = ["docs/", ".github/", "target/"]
 
 [dependencies]
 anyhow = "1.0.99"
 async-trait = "0.1.89"
-axum = { version = "0.8.4", features = ["macros"] }
+axum = { version = "0.8.4", features = ["macros", "ws"] }
 chrono = "0.4.41"
 dotenv = "0.15.0"
+futures = "0.3"
 jsonwebtoken = "9.3.1"
 redis = { version = "0.32.5", features = ["aio", "tokio-comp"], optional = true }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -25,3 +36,22 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 default = ["inmemory"]
 inmemory = []
 redis-backend = ["dep:redis"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "pubsub"
+harness = false
+
+[[bench]]
+name = "auth"
+harness = false
+
+[[bench]]
+name = "rate_limit"
+harness = false
+
+[[bench]]
+name = "room"
+harness = false
