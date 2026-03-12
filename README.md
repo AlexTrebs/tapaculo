@@ -8,21 +8,22 @@ A lightweight Rust server that handles real-time and turn-based communication fo
 
 ## Features
 
-- ** Pluggable PubSub**: Swap between in-memory and Redis backends without code changes
-- ** JWT Authentication**: Secure token-based auth with session tracking and reconnection support
-- ** Room Management**: Capacity limits, player tracking, and lifecycle events
-- ** Real-time WebSocket**: Bidirectional communication with automatic cleanup
-- ** Rate Limiting**: Built-in spam prevention and abuse protection
-- ** Message History**: Optional replay for new joiners
-- ** User Metadata**: Associate custom data with players
-- ** Typed Messages**: Type-safe message handling with serde
-- ** Production Ready**: Comprehensive error handling, logging, and reconnection logic
+- **Pluggable PubSub**: Swap between in-memory and Redis backends without code changes
+- **JWT Authentication**: Secure token-based auth with session tracking and reconnection support
+- **Room Management**: Capacity limits, player tracking, and lifecycle events
+- **Real-time WebSocket**: Bidirectional communication with automatic cleanup
+- **Rate Limiting**: Built-in spam prevention and abuse protection
+- **Message History**: Optional replay for new joiners
+- **User Metadata**: Associate custom data with players
+- **Custom Room State**: Store typed game state per room, accessible from any handler
+- **Typed Messages**: Type-safe message handling with serde
+- **Production Ready**: Comprehensive error handling, logging, and reconnection logic
 
 ## Quick Start
 
 ```toml
 [dependencies]
-tapaculo = "0.2"
+tapaculo = "1.2"
 ```
 
 ### Basic Server
@@ -157,12 +158,14 @@ ctx.broadcast_to_others(data).await?;
 
 // Custom filter
 ctx.broadcast_filtered(data, |user_id| {
-    user_id != "spectator123" // Exclude specific user
+    user_id != "spectator123"
 }).await?;
 
-// Direct message to one player
+// Direct message to one player — works across nodes with Redis
 ctx.send_to("player456", data).await?;
 ```
+
+`broadcast` and `broadcast_to_others` use a single publish to the room topic regardless of player count. `send_to` and `broadcast_filtered` route via per-user topics and work correctly in multi-node Redis deployments.
 
 ### 3. Room Lifecycle Events
 
@@ -300,7 +303,33 @@ if let Some(metadata) = ctx.get_user_metadata("player1").await {
 }
 ```
 
-### 9. Reconnection Support
+### 9. Custom Room State
+
+Store typed game state per room, accessible from any handler:
+
+```rust
+#[derive(Clone)]
+struct GameState {
+    turn: String,
+    score: u32,
+}
+
+// Set initial state when first player joins
+ctx.set_custom_state(GameState { turn: user_id.to_string(), score: 0 }).await?;
+
+// Update state atomically
+ctx.update_custom_state::<GameState, _>(|state| {
+    state.score += 10;
+    state.turn = next_player.to_string();
+}).await?;
+
+// Read state
+if let Some(state) = ctx.get_custom_state::<GameState>().await {
+    ctx.send_to(&state.turn, YourTurn).await?;
+}
+```
+
+### 10. Reconnection Support
 
 Sessions persist across connections:
 
@@ -340,7 +369,7 @@ let pubsub = InMemoryPubSub::with_buffer(128);
 
 ```toml
 [dependencies]
-tapaculo = { version = "0.2", features = ["redis-backend"] }
+tapaculo = { version = "1.2", features = ["redis-backend"] }
 ```
 
 ```rust
@@ -404,17 +433,37 @@ ws.send(JSON.stringify({
 }));
 ```
 
+## Custom HTTP Routes
+
+Use `into_router()` to merge the WebSocket handler with your own axum routes:
+
+```rust
+let app = Server::new()
+    .with_auth(auth)
+    .with_pubsub(pubsub)
+    .on_message(handler)
+    .into_router()
+    .route("/healthz", get(|| async { "ok" }));
+
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+axum::serve(listener, app).await?;
+```
+
 ## Examples
 
 See the `examples/` directory for complete implementations:
 
-- **`chess_server.rs`**: 2-player chess with move validation
-- **`chat_server.rs`**: Group chat with history and typing indicators
+- **`chess_server.rs`**: 2-player turn-based game with room capacity enforcement
+- **`chat_server.rs`**: Group chat with message history and typing indicators
+- **`custom_state.rs`**: Per-room typed game state
+- **`server_with_redis.rs`**: Multi-node deployment with Redis pubsub
 
 Run examples:
 ```bash
 cargo run --example chess_server
 cargo run --example chat_server
+cargo run --example custom_state
+cargo run --example server_with_redis --features redis-backend
 ```
 
 ## Architecture

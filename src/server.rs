@@ -40,7 +40,7 @@ impl RoomMessage {
     self
       .exclude
       .as_ref()
-      .map_or(true, |ex| !ex.iter().any(|id| id == user_id))
+      .is_none_or(|ex| !ex.iter().any(|id| id == user_id))
   }
 }
 
@@ -413,13 +413,36 @@ impl Server {
     self
   }
 
-  /// Start the WebSocket server.
-  pub async fn listen(self, addr: &str) -> anyhow::Result<()> {
+  /// Build the axum [`Router`] for this server.
+  ///
+  /// Use this when you need to merge the WebSocket server with your own HTTP
+  /// routes before serving. Also spawns the background room-cleanup task.
+  ///
+  /// ```rust,no_run
+  /// use tapaculo::*;
+  /// use axum::{routing::get, Router};
+  ///
+  /// #[tokio::main]
+  /// async fn main() -> anyhow::Result<()> {
+  ///     let ws_router = Server::new()
+  ///         .with_auth(JwtAuth::new("secret"))
+  ///         .with_pubsub(InMemoryPubSub::new())
+  ///         .into_router();
+  ///
+  ///     let app = ws_router.route("/healthz", get(|| async { "ok" }));
+  ///
+  ///     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+  ///     axum::serve(listener, app).await?;
+  ///     Ok(())
+  /// }
+  /// ```
+  pub fn into_router(self) -> Router {
     if !self.auth_configured {
       tracing::warn!(
         "Server is using the default JWT secret key. Call .with_auth() before deploying."
       );
     }
+
     let pubsub = self.pubsub.clone();
     let auth = self.auth.clone();
     let on_message = self.on_message.clone();
@@ -438,7 +461,7 @@ impl Server {
       }
     });
 
-    let app = Router::new().route(
+    Router::new().route(
       "/ws",
       get({
         move |ws: WebSocketUpgrade, Query(params): Query<HashMap<String, String>>| {
@@ -472,8 +495,15 @@ impl Server {
           }
         }
       }),
-    );
+    )
+  }
 
+  /// Start the WebSocket server.
+  ///
+  /// Convenience wrapper around [`into_router`] + `axum::serve`. If you need
+  /// to add your own HTTP routes, use [`into_router`] instead.
+  pub async fn listen(self, addr: &str) -> anyhow::Result<()> {
+    let app = self.into_router();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("WebSocket server listening on {}", addr);
     axum::serve(listener, app).await?;

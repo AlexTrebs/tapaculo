@@ -205,6 +205,7 @@ pub use error::PubSubError;
 pub use pubsub::{InMemoryPubSub, PubSubBackend, PubSubExt, Subscription};
 pub use rate_limit::{MessageLimits, RateLimiter};
 pub use room::{PlayerMetadata, RoomInfo, RoomManager, RoomSettings, StoredMessage};
+pub use axum::Router;
 pub use server::{Context, Envelope, RoomEventHandler, Server};
 
 #[cfg(feature = "redis-backend")]
