@@ -17,7 +17,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 /// Message envelope for WebSocket communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +26,23 @@ pub struct Envelope<T> {
   pub data: T,
 }
 
-pub type ClientMap = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<Message>>>>;
+/// Internal pubsub envelope for room-topic routing.
+/// Wraps the already-serialized user-facing message JSON with delivery rules.
+#[derive(Serialize, Deserialize)]
+struct RoomMessage {
+  payload: String,
+  /// None = deliver to all; Some(ids) = exclude these user_ids
+  exclude: Option<Vec<String>>,
+}
+
+impl RoomMessage {
+  fn should_deliver_to(&self, user_id: &str) -> bool {
+    self
+      .exclude
+      .as_ref()
+      .map_or(true, |ex| !ex.iter().any(|id| id == user_id))
+  }
+}
 
 /// Context provided to message handlers, containing room state and communication channels.
 #[derive(Clone)]
@@ -35,7 +51,6 @@ pub struct Context {
   user_id: String,
   session_id: String,
   pubsub: Arc<dyn PubSubBackend>,
-  clients: ClientMap,
   room_manager: RoomManager,
 }
 
@@ -46,9 +61,15 @@ impl Context {
       from: self.user_id.clone(),
       data,
     };
+    let payload =
+      serde_json::to_string(&envelope).map_err(|e| format!("Serialization error: {}", e))?;
+    let msg = RoomMessage {
+      payload,
+      exclude: None,
+    };
     self
       .pubsub
-      .publish(&self.room_id, &envelope)
+      .publish(&self.room_id, &msg)
       .await
       .map_err(|e| format!("Failed to broadcast: {}", e))
   }
@@ -58,19 +79,28 @@ impl Context {
     &self,
     data: T,
   ) -> Result<(), String> {
+    let envelope = Envelope {
+      from: self.user_id.clone(),
+      data,
+    };
+    let payload =
+      serde_json::to_string(&envelope).map_err(|e| format!("Serialization error: {}", e))?;
+    let msg = RoomMessage {
+      payload,
+      exclude: Some(vec![self.user_id.clone()]),
+    };
     self
-      .broadcast_filtered(data, |user_id| user_id != self.user_id)
+      .pubsub
+      .publish(&self.room_id, &msg)
       .await
+      .map_err(|e| format!("Failed to broadcast: {}", e))
   }
 
   /// Broadcast a message with a custom filter function.
   ///
   /// The filter receives each user_id and should return true to send to that user.
-  pub async fn broadcast_filtered<T, F>(
-    &self,
-    data: T,
-    filter: F,
-  ) -> Result<(), String>
+  /// Note: implemented via per-user dm topics (O(k) publishes where k = matching users).
+  pub async fn broadcast_filtered<T, F>(&self, data: T, filter: F) -> Result<(), String>
   where
     T: Serialize + Send + Sync,
     F: Fn(&str) -> bool,
@@ -81,27 +111,35 @@ impl Context {
     };
     let json =
       serde_json::to_string(&envelope).map_err(|e| format!("Serialization error: {}", e))?;
-
-    let clients = self.clients.read().await;
-    for (user_id, sender) in clients.iter() {
-      if filter(user_id) {
-        let _ = sender.send(Message::Text(json.clone().into()));
-      }
+    let members = self.get_room_members().await;
+    for uid in members.iter().filter(|id| filter(id.as_str())) {
+      let user_topic = format!("user:{}", uid);
+      let _ = self
+        .pubsub
+        .publish_bytes(&user_topic, json.as_bytes().to_vec())
+        .await;
     }
     Ok(())
   }
 
-  /// Send a message directly to a specific player via WebSocket.
+  /// Send a message directly to a specific player.
+  /// Works across nodes — routes via the player's user pubsub topic.
   pub async fn send_to<T: Serialize>(&self, player_id: &str, msg: T) -> Result<(), String> {
-    let json = serde_json::to_string(&msg).map_err(|e| format!("Serialization error: {}", e))?;
-    let clients = self.clients.read().await;
-    if let Some(sender) = clients.get(player_id) {
-      sender
-        .send(Message::Text(json.into()))
-        .map_err(|e| format!("Failed to send message: {}", e))?;
-      Ok(())
-    } else {
-      Err(format!("Client {} not found", player_id))
+    let envelope = Envelope {
+      from: self.user_id.clone(),
+      data: msg,
+    };
+    let json =
+      serde_json::to_string(&envelope).map_err(|e| format!("Serialization error: {}", e))?;
+    let user_topic = format!("user:{}", player_id);
+    match self
+      .pubsub
+      .publish_bytes(&user_topic, json.into_bytes())
+      .await
+    {
+      Ok(()) => Ok(()),
+      Err(crate::PubSubError::NoSubscribers(_)) => Ok(()), // player offline or on another node
+      Err(e) => Err(format!("Failed to send message: {}", e)),
     }
   }
 
@@ -154,13 +192,15 @@ impl Context {
   pub async fn get_message_history(&self, limit: usize) -> Vec<StoredMessage> {
     if let Some(room) = self.room_manager.get_room(&self.room_id).await {
       let room = room.read().await;
-      room
+      let mut msgs: Vec<StoredMessage> = room
         .message_history
         .iter()
         .rev()
         .take(limit)
         .cloned()
-        .collect()
+        .collect();
+      msgs.reverse();
+      msgs
     } else {
       Vec::new()
     }
@@ -184,6 +224,53 @@ impl Context {
       room.players.get(user_id).cloned()
     } else {
       None
+    }
+  }
+
+  /// Get a clone of the custom state (if set and type matches)
+  /// Note: Returns a clone to avoid holding the read lock
+  pub async fn get_custom_state<T: 'static + Clone>(&self) -> Option<T> {
+    if let Some(room) = self.room_manager.get_room(&self.room_id).await {
+      let room = room.read().await;
+      room.get_custom_state::<T>().cloned()
+    } else {
+      None
+    }
+  }
+
+  /// Set the custom state (replaces existing state)
+  pub async fn set_custom_state<T: 'static + Send + Sync>(&self, state: T) -> Result<(), String> {
+    if let Some(room) = self.room_manager.get_room(&self.room_id).await {
+      let mut room = room.write().await;
+      room.set_custom_state(state);
+      Ok(())
+    } else {
+      Err("Room not found".to_string())
+    }
+  }
+
+  /// Update the custom state using a closure
+  pub async fn update_custom_state<T, F>(&self, f: F) -> Result<(), String>
+  where
+    T: 'static + Send + Sync,
+    F: FnOnce(&mut T),
+  {
+    if let Some(room) = self.room_manager.get_room(&self.room_id).await {
+      let mut room = room.write().await;
+      room.update_custom_state(f)
+    } else {
+      Err("Room not found".to_string())
+    }
+  }
+
+  /// Clear the custom state
+  pub async fn clear_custom_state(&self) -> Result<(), String> {
+    if let Some(room) = self.room_manager.get_room(&self.room_id).await {
+      let mut room = room.write().await;
+      room.clear_custom_state();
+      Ok(())
+    } else {
+      Err("Room not found".to_string())
     }
   }
 }
@@ -210,18 +297,21 @@ struct NoOpEventHandler;
 impl RoomEventHandler for NoOpEventHandler {}
 
 type MessageHandler = Arc<
-  dyn Fn(Context, Envelope<serde_json::Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+  dyn Fn(
+      Context,
+      Envelope<serde_json::Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     + Send
     + Sync,
 >;
 
-type MessageValidator = Arc<
-  dyn Fn(&Context, &Envelope<serde_json::Value>) -> Result<(), String> + Send + Sync,
->;
+type MessageValidator =
+  Arc<dyn Fn(&Context, &Envelope<serde_json::Value>) -> Result<(), String> + Send + Sync>;
 
 /// WebSocket server for multiplayer games.
 pub struct Server {
   auth: JwtAuth,
+  auth_configured: bool,
   pubsub: Arc<dyn PubSubBackend>,
   room_manager: RoomManager,
   rate_limiter: Option<RateLimiter>,
@@ -235,6 +325,7 @@ impl Server {
   pub fn new() -> Self {
     Self {
       auth: JwtAuth::new("secret"),
+      auth_configured: false,
       pubsub: Arc::new(crate::InMemoryPubSub::new()),
       room_manager: RoomManager::new(RoomSettings::default()),
       rate_limiter: None,
@@ -247,6 +338,7 @@ impl Server {
   /// Configure the JWT authentication handler.
   pub fn with_auth(mut self, auth: JwtAuth) -> Self {
     self.auth = auth;
+    self.auth_configured = true;
     self
   }
 
@@ -323,7 +415,11 @@ impl Server {
 
   /// Start the WebSocket server.
   pub async fn listen(self, addr: &str) -> anyhow::Result<()> {
-    let clients: ClientMap = Arc::new(RwLock::new(HashMap::new()));
+    if !self.auth_configured {
+      tracing::warn!(
+        "Server is using the default JWT secret key. Call .with_auth() before deploying."
+      );
+    }
     let pubsub = self.pubsub.clone();
     let auth = self.auth.clone();
     let on_message = self.on_message.clone();
@@ -345,9 +441,7 @@ impl Server {
     let app = Router::new().route(
       "/ws",
       get({
-        let clients = clients.clone();
         move |ws: WebSocketUpgrade, Query(params): Query<HashMap<String, String>>| {
-          let clients = clients.clone();
           let pubsub = pubsub.clone();
           let auth = auth.clone();
           let on_message = on_message.clone();
@@ -364,7 +458,6 @@ impl Server {
                     claims.sub,
                     claims.room,
                     claims.session_id,
-                    clients,
                     pubsub,
                     room_manager,
                     rate_limiter,
@@ -401,7 +494,6 @@ async fn handle_ws(
   user_id: String,
   room_id: String,
   session_id: String,
-  clients: ClientMap,
   pubsub: Arc<dyn PubSubBackend>,
   room_manager: RoomManager,
   rate_limiter: Option<RateLimiter>,
@@ -422,19 +514,25 @@ async fn handle_ws(
   };
 
   if let Err(e) = join_result {
-    tracing::warn!("Failed to add player {} to room {}: {}", user_id, room_id, e);
+    tracing::warn!(
+      "Failed to add player {} to room {}: {}",
+      user_id,
+      room_id,
+      e
+    );
     let _ = sender_ws
-      .send(Message::Text(
-        format!(r#"{{"error":"{}"}}"#, e).into(),
-      ))
+      .send(Message::Text(format!(r#"{{"error":"{}"}}"#, e).into()))
       .await;
     let _ = sender_ws.close().await;
     return;
   }
 
-  // Register client
-  clients.write().await.insert(user_id.clone(), tx.clone());
-  tracing::info!("User {} (session {}) connected to room {}", user_id, session_id, room_id);
+  tracing::info!(
+    "User {} (session {}) connected to room {}",
+    user_id,
+    session_id,
+    room_id
+  );
 
   // Check if room is now full
   let is_full = {
@@ -442,15 +540,19 @@ async fn handle_ws(
     room_guard.is_full()
   };
 
-  // Subscribe to pubsub topic for this room
-  let subscription = match pubsub
+  // Subscribe to room topic — routing-aware delivery
+  let room_sub = match pubsub
     .subscribe(&room_id, {
       let tx = tx.clone();
+      let user_id = user_id.clone();
       move |bytes| {
         let tx = tx.clone();
+        let user_id = user_id.clone();
         async move {
-          if let Ok(msg) = String::from_utf8(bytes) {
-            let _ = tx.send(Message::Text(msg.into()));
+          if let Ok(msg) = serde_json::from_slice::<RoomMessage>(&bytes) {
+            if msg.should_deliver_to(&user_id) {
+              let _ = tx.send(Message::Text(msg.payload.into()));
+            }
           }
         }
       }
@@ -464,12 +566,34 @@ async fn handle_ws(
     }
   };
 
+  // Subscribe to per-user topic for targeted cross-node delivery
+  let user_topic = format!("user:{}", user_id);
+  let user_sub = match pubsub
+    .subscribe(&user_topic, {
+      let tx = tx.clone();
+      move |bytes| {
+        let tx = tx.clone();
+        async move {
+          if let Ok(text) = String::from_utf8(bytes) {
+            let _ = tx.send(Message::Text(text.into()));
+          }
+        }
+      }
+    })
+    .await
+  {
+    Ok(sub) => sub,
+    Err(e) => {
+      tracing::error!("Failed to subscribe to dm topic for {}: {}", user_id, e);
+      return;
+    }
+  };
+
   let ctx = Context {
     room_id: room_id.clone(),
     user_id: user_id.clone(),
     session_id: session_id.clone(),
     pubsub: pubsub.clone(),
-    clients: clients.clone(),
     room_manager: room_manager.clone(),
   };
 
@@ -485,7 +609,9 @@ async fn handle_ws(
   let ctx_clone = ctx.clone();
   let user_id_clone = user_id.clone();
   let room_id_clone = room_id.clone();
+  let rate_limiter_task = rate_limiter.clone();
   let receiver_task = tokio::spawn(async move {
+    let rate_limiter = rate_limiter_task;
     while let Some(Ok(msg)) = receiver_ws.next().await {
       match msg {
         Message::Text(text) => {
@@ -548,8 +674,10 @@ async fn handle_ws(
     _ = sender_task => {},
   }
 
-  // Cleanup: remove client, remove from room, stop subscription
-  clients.write().await.remove(&user_id);
+  // Cleanup: remove from room, stop subscriptions, evict rate limit state
+  if let Some(ref limiter) = rate_limiter {
+    limiter.reset_user(&user_id).await;
+  }
 
   let is_empty = {
     let mut room_guard = room.write().await;
@@ -557,7 +685,8 @@ async fn handle_ws(
     room_guard.is_empty()
   };
 
-  subscription.abort();
+  room_sub.abort();
+  user_sub.abort();
 
   // Notify that player left
   event_handler.on_player_left(&ctx, &user_id).await;

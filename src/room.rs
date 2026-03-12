@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+  any::Any,
   collections::{HashMap, VecDeque},
   sync::Arc,
   time::{Duration, Instant},
@@ -88,6 +89,9 @@ pub struct Room {
   pub message_history: VecDeque<StoredMessage>,
   pub created_at: Instant,
   pub last_activity: Instant,
+  /// Optional custom state for application-specific data (game state, shared settings, etc.)
+  /// Use set_custom_state/get_custom_state methods for type-safe access
+  pub custom_state: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Room {
@@ -100,6 +104,7 @@ impl Room {
       message_history: VecDeque::new(),
       created_at: now,
       last_activity: now,
+      custom_state: None,
     }
   }
 
@@ -151,6 +156,43 @@ impl Room {
       created_at: self.created_at,
       members: self.players.keys().cloned().collect(),
     }
+  }
+
+  /// Get a reference to the custom state with type checking
+  pub fn get_custom_state<T: 'static>(&self) -> Option<&T> {
+    self
+      .custom_state
+      .as_ref()
+      .and_then(|state| state.downcast_ref::<T>())
+  }
+
+  /// Set the custom state (replaces existing state)
+  pub fn set_custom_state<T: 'static + Send + Sync>(&mut self, state: T) {
+    self.custom_state = Some(Box::new(state));
+    self.last_activity = Instant::now();
+  }
+
+  /// Update the custom state using a closure
+  pub fn update_custom_state<T: 'static + Send + Sync, F>(&mut self, f: F) -> Result<(), String>
+  where
+    F: FnOnce(&mut T),
+  {
+    if let Some(state) = &mut self.custom_state {
+      if let Some(typed_state) = state.downcast_mut::<T>() {
+        f(typed_state);
+        self.last_activity = Instant::now();
+        Ok(())
+      } else {
+        Err("Custom state type mismatch".to_string())
+      }
+    } else {
+      Err("No custom state set".to_string())
+    }
+  }
+
+  /// Remove the custom state
+  pub fn clear_custom_state(&mut self) {
+    self.custom_state = None;
   }
 }
 
