@@ -15,6 +15,7 @@ A lightweight Rust server that handles real-time and turn-based communication fo
 - **Rate Limiting**: Built-in spam prevention and abuse protection
 - **Message History**: Optional replay for new joiners
 - **User Metadata**: Associate custom data with players
+- **Token Endpoint**: Optional `POST /token` route for server-side JWT minting
 - **Custom Room State**: Store typed game state per room, accessible from any handler
 - **Typed Messages**: Type-safe message handling with serde
 - **Production Ready**: Comprehensive error handling, logging, and reconnection logic
@@ -414,6 +415,34 @@ let new_access = auth.refresh_access(
     3600
 )?;
 ```
+
+### Token Endpoint
+
+Enable a built-in `POST /token` route so clients can obtain JWTs without a separate auth service:
+
+```rust
+Server::new()
+    .with_auth(JwtAuth::new("secret"))
+    .with_pubsub(InMemoryPubSub::new())
+    .with_token_endpoint()          // enable POST /token
+    .with_token_ttl(1800)           // optional: 30 min TTL (default 3600)
+    .listen("0.0.0.0:8080")
+    .await
+```
+
+Clients POST `{ "user_id": "...", "room_id": "..." }` and receive `{ "token": "..." }`:
+
+```javascript
+const res = await fetch("http://localhost:8080/token", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ user_id: "player1", room_id: "room42" }),
+});
+const { token } = await res.json();
+const ws = new WebSocket(`ws://localhost:8080/ws?token=${token}`);
+```
+
+> **Note:** The `/token` endpoint performs no authorization itself — add your own middleware or proxy-level auth before exposing it publicly.
 
 ### Client Connection
 
