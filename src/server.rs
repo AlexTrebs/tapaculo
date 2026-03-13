@@ -8,13 +8,15 @@ use crate::{
 use axum::{
   extract::{
     ws::{Message, WebSocket},
-    Query, WebSocketUpgrade,
+    Query, State, WebSocketUpgrade,
   },
+  http::StatusCode,
   response::IntoResponse,
-  routing::get,
-  Router,
+  routing::{get, post},
+  Json, Router,
 };
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
@@ -308,6 +310,56 @@ type MessageHandler = Arc<
 type MessageValidator =
   Arc<dyn Fn(&Context, &Envelope<serde_json::Value>) -> Result<(), String> + Send + Sync>;
 
+// ── Token endpoint ────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct TokenEndpointState {
+  auth: JwtAuth,
+  token_ttl_secs: usize,
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+  user_id: String,
+  room_id: String,
+}
+
+#[derive(Serialize)]
+struct TokenResponse {
+  token: String,
+}
+
+async fn token_handler(
+  State(state): State<TokenEndpointState>,
+  Json(body): Json<TokenRequest>,
+) -> Result<Json<TokenResponse>, StatusCode> {
+  let session_id = random_session_id();
+  let token = state
+    .auth
+    .sign_access(body.user_id, body.room_id, session_id, state.token_ttl_secs)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+  Ok(Json(TokenResponse { token }))
+}
+
+fn random_session_id() -> String {
+  let mut rng = rand::thread_rng();
+  let bytes: [u8; 16] = rng.r#gen();
+  format!(
+    "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+    u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+    u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+    u16::from_be_bytes(bytes[6..8].try_into().unwrap()) & 0x0fff,
+    (u16::from_be_bytes(bytes[8..10].try_into().unwrap()) & 0x3fff) | 0x8000,
+    {
+      let mut n = 0u64;
+      for b in &bytes[10..16] {
+        n = (n << 8) | *b as u64;
+      }
+      n
+    }
+  )
+}
+
 /// WebSocket server for multiplayer games.
 pub struct Server {
   auth: JwtAuth,
@@ -318,6 +370,8 @@ pub struct Server {
   on_message: MessageHandler,
   message_validator: Option<MessageValidator>,
   event_handler: Arc<dyn RoomEventHandler>,
+  token_endpoint: bool,
+  token_ttl_secs: usize,
 }
 
 impl Server {
@@ -332,6 +386,8 @@ impl Server {
       on_message: Arc::new(|_, _| Box::pin(async {})),
       message_validator: None,
       event_handler: Arc::new(NoOpEventHandler),
+      token_endpoint: false,
+      token_ttl_secs: 3600,
     }
   }
 
@@ -413,6 +469,23 @@ impl Server {
     self
   }
 
+  /// Enable a `POST /token` endpoint that mints JWT access tokens.
+  ///
+  /// Clients POST `{ "user_id": "...", "room_id": "..." }` and receive
+  /// `{ "token": "..." }` which they use as the WebSocket `?token=` query param.
+  /// Pair with [`with_token_ttl`] to control expiry.
+  pub fn with_token_endpoint(mut self) -> Self {
+    self.token_endpoint = true;
+    self
+  }
+
+  /// Set the TTL (seconds) for tokens issued by the `/token` endpoint.
+  /// Defaults to 3600 (1 hour).
+  pub fn with_token_ttl(mut self, secs: usize) -> Self {
+    self.token_ttl_secs = secs;
+    self
+  }
+
   /// Build the axum [`Router`] for this server.
   ///
   /// Use this when you need to merge the WebSocket server with your own HTTP
@@ -461,7 +534,7 @@ impl Server {
       }
     });
 
-    Router::new().route(
+    let mut router = Router::new().route(
       "/ws",
       get({
         move |ws: WebSocketUpgrade, Query(params): Query<HashMap<String, String>>| {
@@ -495,7 +568,21 @@ impl Server {
           }
         }
       }),
-    )
+    );
+
+    if self.token_endpoint {
+      let token_state = TokenEndpointState {
+        auth: self.auth.clone(),
+        token_ttl_secs: self.token_ttl_secs,
+      };
+      router = router.merge(
+        Router::new()
+          .route("/token", post(token_handler))
+          .with_state(token_state),
+      );
+    }
+
+    router
   }
 
   /// Start the WebSocket server.
